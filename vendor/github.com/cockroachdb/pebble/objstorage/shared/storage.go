@@ -16,8 +16,8 @@ type Storage interface {
 	io.Closer
 
 	// ReadObjectAt returns a Reader for reading the object at the requested name
-	// and offset.
-	ReadObjectAt(basename string, offset int64) (io.ReadCloser, int64, error)
+	// and offset, along with the total size of the object.
+	ReadObjectAt(basename string, offset int64) (_ io.ReadCloser, totalSize int64, _ error)
 
 	// CreateObject returns a writer for the object at the request name. A new
 	// empty object is created if CreateObject is called on an existing object.
@@ -27,6 +27,10 @@ type Storage interface {
 	// implementation may buffer written data until Close and only then return
 	// an error, or Write may return an opaque io.EOF with the underlying cause
 	// returned by the subsequent Close().
+	//
+	// TODO(radu): if we encounter some unrelated error while writing to the
+	// WriteCloser, we'd want to abort the whole thing rather than letting Close
+	// finalize the upload.
 	CreateObject(basename string) (io.WriteCloser, error)
 
 	// List enumerates files within the supplied prefix, returning a list of
@@ -47,6 +51,10 @@ type Storage interface {
 	// Delete removes the named object from the store.
 	Delete(basename string) error
 
-	// Size returns the length of the named object in bytes.
+	// Size returns the length of the named object in bytesWritten.
 	Size(basename string) (int64, error)
+
+	// IsNotExistError returns true if the given error (returned by a method in
+	// this interface) indicates that the object does not exist.
+	IsNotExistError(err error) bool
 }

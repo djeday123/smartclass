@@ -27,6 +27,17 @@ test:
 testrace: testflags += -race -timeout 20m
 testrace: test
 
+testasan: testflags += -asan -timeout 20m
+testasan: test
+
+testmsan: export CC=clang
+testmsan: testflags += -msan -timeout 20m
+testmsan: test
+
+.PHONY: testobjiotracing
+testobjiotracing:
+	${GO} test -tags '$(TAGS) pebble_obj_io_tracing' ${testflags} -run ${TESTS} ./objstorage/objstorageprovider/objiotracing
+
 .PHONY: lint
 lint:
 	${GO} test -tags '$(TAGS)' ${testflags} -run ${TESTS} ./internal/lint
@@ -52,7 +63,7 @@ crossversion-meta:
 
 .PHONY: stress-crossversion
 stress-crossversion:
-	STRESS=1 ./scripts/run-crossversion-meta.sh crl-release-21.2 crl-release-22.1 crl-release-22.2 master
+	STRESS=1 ./scripts/run-crossversion-meta.sh crl-release-21.2 crl-release-22.1 crl-release-22.2 crl-release-23.1 master
 
 .PHONY: generate
 generate:

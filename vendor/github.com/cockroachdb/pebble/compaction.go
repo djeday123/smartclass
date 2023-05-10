@@ -13,7 +13,6 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -25,6 +24,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -35,6 +35,12 @@ var errFlushInvariant = errors.New("pebble: flush next log number is unset")
 var compactLabels = pprof.Labels("pebble", "compact")
 var flushLabels = pprof.Labels("pebble", "flush")
 var gcLabels = pprof.Labels("pebble", "gc")
+
+// getInternalWriterProperties accesses a private variable (in the
+// internal/private package) initialized by the sstable Writer. This indirection
+// is necessary to ensure non-Pebble users constructing sstables for ingestion
+// are unable to set internal-only properties.
+var getInternalWriterProperties = private.SSTableInternalProperties.(func(*sstable.Writer) *sstable.Properties)
 
 // expandedCompactionByteSizeLimit is the maximum number of bytes in all
 // compacted files. We avoid expanding the lower level file set of a compaction
@@ -134,26 +140,179 @@ type compactionOutputSplitter interface {
 	onNewOutput(key []byte) []byte
 }
 
-// fileSizeSplitter is a compactionOutputSplitter that makes a determination
-// to split outputs based on the estimated file size of the current output.
-// Note that, unlike most other splitters, this splitter does not guarantee
-// that it will advise splits only at user key change boundaries.
+// fileSizeSplitter is a compactionOutputSplitter that enforces target file
+// sizes. This splitter splits to a new output file when the estimated file size
+// is 0.5x-2x the target file size. If there are overlapping grandparent files,
+// this splitter will attempt to split at a grandparent boundary. For example,
+// consider the example where a compaction wrote 'd' to the current output file,
+// and the next key has a user key 'g':
+//
+//	                              previous key   next key
+//		                                 |           |
+//		                                 |           |
+//		                 +---------------|----+   +--|----------+
+//		  grandparents:  |       000006  |    |   |  | 000007   |
+//		                 +---------------|----+   +--|----------+
+//		                 a    b          d    e   f  g       i
+//
+// Splitting the output file F before 'g' will ensure that the current output
+// file F does not overlap the grandparent file 000007. Aligning sstable
+// boundaries like this can significantly reduce write amplification, since a
+// subsequent compaction of F into the grandparent level will avoid needlessly
+// rewriting any keys within 000007 that do not overlap F's bounds. Consider the
+// following compaction:
+//
+//	                       +----------------------+
+//		  input            |                      |
+//		  level            +----------------------+
+//		                              \/
+//		           +---------------+       +---------------+
+//		  output   |XXXXXXX|       |       |      |XXXXXXXX|
+//		  level    +---------------+       +---------------+
+//
+// The input-level file overlaps two files in the output level, but only
+// partially. The beginning of the first output-level file and the end of the
+// second output-level file will be rewritten verbatim. This write I/O is
+// "wasted" in the sense that no merging is being performed.
+//
+// To prevent the above waste, this splitter attempts to split output files
+// before the start key of grandparent files. It still strives to write output
+// files of approximately the target file size, by constraining this splitting
+// at grandparent points to apply only if the current output's file size is
+// about the right order of magnitude.
+//
+// Note that, unlike most other splitters, this splitter does not guarantee that
+// it will advise splits only at user key change boundaries.
 type fileSizeSplitter struct {
-	maxFileSize uint64
+	frontier              frontier
+	targetFileSize        uint64
+	atGrandparentBoundary bool
+	boundariesObserved    uint64
+	nextGrandparent       *fileMetadata
+	grandparents          manifest.LevelIterator
+}
+
+func newFileSizeSplitter(
+	f *frontiers, targetFileSize uint64, grandparents manifest.LevelIterator,
+) *fileSizeSplitter {
+	s := &fileSizeSplitter{targetFileSize: targetFileSize}
+	s.nextGrandparent = grandparents.First()
+	s.grandparents = grandparents
+	if s.nextGrandparent != nil {
+		s.frontier.Init(f, s.nextGrandparent.Smallest.UserKey, s.reached)
+	}
+	return s
+}
+
+func (f *fileSizeSplitter) reached(nextKey []byte) []byte {
+	f.atGrandparentBoundary = true
+	f.boundariesObserved++
+	// NB: f.grandparents is a bounded iterator, constrained to the compaction
+	// key range.
+	f.nextGrandparent = f.grandparents.Next()
+	if f.nextGrandparent == nil {
+		return nil
+	}
+	// TODO(jackson): Should we also split before or immediately after
+	// grandparents' largest keys? Splitting before the start boundary prevents
+	// overlap with the grandparent. Also splitting after the end boundary may
+	// increase the probability of move compactions.
+	return f.nextGrandparent.Smallest.UserKey
 }
 
 func (f *fileSizeSplitter) shouldSplitBefore(key *InternalKey, tw *sstable.Writer) maybeSplit {
-	// The Kind != RangeDelete part exists because EstimatedSize doesn't grow
-	// rightaway when a range tombstone is added to the fragmenter. It's always
-	// better to make a sequence of range tombstones visible to the fragmenter.
-	if key.Kind() != InternalKeyKindRangeDelete && tw != nil &&
-		tw.EstimatedSize() >= f.maxFileSize {
+	atGrandparentBoundary := f.atGrandparentBoundary
+
+	// Clear f.atGrandparentBoundary unconditionally.
+	//
+	// This is a bit subtle. Even if do decide to split, it's possible that a
+	// higher-level splitter will ignore our request (eg, because we're between
+	// two internal keys with the same user key). In this case, the next call to
+	// shouldSplitBefore will find atGrandparentBoundary=false. This is
+	// desirable, because in this case we would've already written the earlier
+	// key with the same user key to the output file. The current output file is
+	// already doomed to overlap the grandparent whose bound triggered
+	// atGrandparentBoundary=true. We should continue on, waiting for the next
+	// grandparent boundary.
+	f.atGrandparentBoundary = false
+
+	// If the key is a range tombstone, the EstimatedSize may not grow right
+	// away when a range tombstone is added to the fragmenter: It's dependent on
+	// whether or not the this new range deletion will start a new fragment.
+	// Range deletions are rare, so we choose to simply not split yet.
+	// TODO(jackson): Reconsider this, and consider range keys too as a part of
+	// #2321.
+	if key.Kind() == InternalKeyKindRangeDelete || tw == nil {
+		return noSplit
+	}
+
+	estSize := tw.EstimatedSize()
+	switch {
+	case estSize < f.targetFileSize/2:
+		// The estimated file size is less than half the target file size. Don't
+		// split it, even if currently aligned with a grandparent file because
+		// it's too small.
+		return noSplit
+	case estSize >= 2*f.targetFileSize:
+		// The estimated file size is double the target file size. Split it even
+		// if we were not aligned with a grandparent file boundary to avoid
+		// excessively exceeding the target file size.
+		return splitNow
+	case !atGrandparentBoundary:
+		// Don't split if we're not at a grandparent, except if we've exhausted
+		// all the grandparents overlapping this compaction's key range. Then we
+		// may want to split purely based on file size.
+		if f.nextGrandparent == nil {
+			// There are no more grandparents. Optimize for the target file size
+			// and split as soon as we hit the target file size.
+			if estSize >= f.targetFileSize {
+				return splitNow
+			}
+		}
+		return noSplit
+	default:
+		// INVARIANT: atGrandparentBoundary
+		// INVARIANT: targetSize/2 < estSize < 2*targetSize
+		//
+		// The estimated file size is close enough to the target file size that
+		// we should consider splitting.
+		//
+		// Determine whether to split now based on how many grandparent
+		// boundaries we have already observed while building this output file.
+		// The intuition here is that if the grandparent level is dense in this
+		// part of the keyspace, we're likely to continue to have more
+		// opportunities to split this file aligned with a grandparent. If this
+		// is the first grandparent boundary observed, we split immediately
+		// (we're already at ≥50% the target file size). Otherwise, each
+		// overlapping grandparent we've observed increases the minimum file
+		// size by 5% of the target file size, up to at most 90% of the target
+		// file size.
+		//
+		// TODO(jackson): The particular thresholds are somewhat unprincipled.
+		// This is the same heuristic as RocksDB implements. Is there are more
+		// principled formulation that can, further reduce w-amp, produce files
+		// closer to the target file size, or is more understandable?
+
+		// NB: Subtract 1 from `boundariesObserved` to account for the current
+		// boundary we're considering splitting at. `reached` will have
+		// incremented it at the same time it set `atGrandparentBoundary`.
+		minimumPctOfTargetSize := 50 + 5*minUint64(f.boundariesObserved-1, 8)
+		if estSize < (minimumPctOfTargetSize*f.targetFileSize)/100 {
+			return noSplit
+		}
 		return splitNow
 	}
-	return noSplit
+}
+
+func minUint64(a, b uint64) uint64 {
+	if b < a {
+		a = b
+	}
+	return a
 }
 
 func (f *fileSizeSplitter) onNewOutput(key []byte) []byte {
+	f.boundariesObserved = 0
 	return nil
 }
 
@@ -277,15 +436,14 @@ type compactionWritable struct {
 }
 
 // Write is part of the objstorage.Writable interface.
-func (c *compactionWritable) Write(p []byte) (n int, err error) {
-	n, err = c.Writable.Write(p)
-	if err != nil {
-		return n, err
+func (c *compactionWritable) Write(p []byte) error {
+	if err := c.Writable.Write(p); err != nil {
+		return err
 	}
 
-	*c.written += int64(n)
-	c.versions.incrementCompactionBytes(int64(n))
-	return n, err
+	*c.written += int64(len(p))
+	c.versions.incrementCompactionBytes(int64(len(p)))
+	return nil
 }
 
 type compactionKind int
@@ -1165,8 +1323,8 @@ func (c *compaction) newInputIter(
 	newRangeDelIter := func(
 		f manifest.LevelFile, _ *IterOptions, bytesIterated *uint64,
 	) (keyspan.FragmentIterator, error) {
-		iter, rangeDelIter, err := newIters(f.FileMetadata, nil, /* iter options */
-			internalIterOpts{bytesIterated: &c.bytesIterated})
+		iter, rangeDelIter, err := newIters(context.Background(), f.FileMetadata,
+			nil /* iter options */, internalIterOpts{bytesIterated: &c.bytesIterated})
 		if err == nil {
 			// TODO(peter): It is mildly wasteful to open the point iterator only to
 			// immediately close it. One way to solve this would be to add new
@@ -1232,7 +1390,9 @@ func (c *compaction) newInputIter(
 			// of range tombstones outside the file's internal key bounds. Skip
 			// any range tombstones completely outside file bounds.
 			rangeDelIter = keyspan.Truncate(
-				c.cmp, rangeDelIter, lowerBound.UserKey, upperBound.UserKey, &f.Smallest, &f.Largest)
+				c.cmp, rangeDelIter, lowerBound.UserKey, upperBound.UserKey,
+				&f.Smallest, &f.Largest,
+			)
 		}
 		if rangeDelIter == nil {
 			rangeDelIter = emptyKeyspanIter
@@ -1509,16 +1669,16 @@ func (d *DB) removeInProgressCompaction(c *compaction, rollback bool) {
 
 func (d *DB) calculateDiskAvailableBytes() uint64 {
 	if space, err := d.opts.FS.GetDiskUsage(d.dirname); err == nil {
-		atomic.StoreUint64(&d.atomic.diskAvailBytes, space.AvailBytes)
+		d.diskAvailBytes.Store(space.AvailBytes)
 		return space.AvailBytes
 	} else if !errors.Is(err, vfs.ErrUnsupported) {
 		d.opts.EventListener.BackgroundError(err)
 	}
-	return atomic.LoadUint64(&d.atomic.diskAvailBytes)
+	return d.diskAvailBytes.Load()
 }
 
 func (d *DB) getDiskAvailableBytesCached() uint64 {
-	return atomic.LoadUint64(&d.atomic.diskAvailBytes)
+	return d.diskAvailBytes.Load()
 }
 
 func (d *DB) getDeletionPacerInfo() deletionPacerInfo {
@@ -1684,12 +1844,12 @@ func (d *DB) runIngestFlush(c *compaction) (*manifest.VersionEdit, error) {
 	for _, file := range c.flushing[0].flushable.(*ingestedFlushable).files {
 		level, err = ingestTargetLevel(
 			d.newIters, d.tableNewRangeKeyIter, iterOpts, d.cmp,
-			c.version, baseLevel, d.mu.compact.inProgress, file,
+			c.version, baseLevel, d.mu.compact.inProgress, file.FileMetadata,
 		)
 		if err != nil {
 			return nil, err
 		}
-		ve.NewFiles = append(ve.NewFiles, newFileEntry{Level: level, Meta: file})
+		ve.NewFiles = append(ve.NewFiles, newFileEntry{Level: level, Meta: file.FileMetadata})
 		levelMetrics := c.metrics[level]
 		if levelMetrics == nil {
 			levelMetrics = &LevelMetrics{}
@@ -1740,7 +1900,8 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	// flushable batch in the same flush, since the memtable and flushableBatch
 	// have the same logNum, the errFlushInvariant check below will trigger and
 	// prevent the flush from continuing.
-	var n int
+	var n, inputs int
+	var ingest bool
 	for ; n < len(d.mu.mem.queue)-1; n++ {
 		if f, ok := d.mu.mem.queue[n].flushable.(*ingestedFlushable); ok {
 			if n == 0 {
@@ -1753,8 +1914,11 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 					panic("pebble: ingestedFlushable should always be ready to flush.")
 				}
 				// By setting n = 1, we ensure that the first flushable(n == 0)
-				// is scheduled for a flush.
+				// is scheduled for a flush. The number of tables added is equal to the
+				// number of files in the ingest operation.
 				n = 1
+				inputs = len(f.files)
+				ingest = true
 				break
 			} else {
 				// There was some prefix of flushables which weren't of type
@@ -1769,6 +1933,11 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	if n == 0 {
 		// None of the immutable memtables are ready for flushing.
 		return 0, nil
+	}
+	if !ingest {
+		// Flushes of memtables add the prefix of n memtables from the flushable
+		// queue.
+		inputs = n
 	}
 
 	// Require that every memtable being flushed has a log number less than the
@@ -1790,13 +1959,15 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	jobID := d.mu.nextJobID
 	d.mu.nextJobID++
 	d.opts.EventListener.FlushBegin(FlushInfo{
-		JobID: jobID,
-		Input: n,
+		JobID:  jobID,
+		Input:  inputs,
+		Ingest: ingest,
 	})
 	startTime := d.timeNow()
 
 	var ve *manifest.VersionEdit
-	var pendingOutputs []*manifest.FileMetadata
+	var pendingOutputs []physicalMeta
+	var stats compactStats
 	// To determine the target level of the files in the ingestedFlushable, we
 	// need to acquire the logLock, and not release it for that duration. Since,
 	// we need to acquire the logLock below to perform the logAndApply step
@@ -1804,7 +1975,7 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	// runCompaction. For all other flush cases, we construct the VersionEdit
 	// inside runCompaction.
 	if c.kind != compactionKindIngestedFlushable {
-		ve, pendingOutputs, err = d.runCompaction(jobID, c)
+		ve, pendingOutputs, stats, err = d.runCompaction(jobID, c)
 	}
 
 	// Acquire logLock. This will be released either on an error, by way of
@@ -1815,19 +1986,23 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 		ve, err = d.runIngestFlush(c)
 	}
 
-	// TODO(bananabrick): Update the FlushInfo output message. The files are
-	// not necessarily being flushed to L0.
 	info := FlushInfo{
 		JobID:    jobID,
-		Input:    n,
+		Input:    inputs,
 		Duration: d.timeNow().Sub(startTime),
 		Done:     true,
+		Ingest:   ingest,
 		Err:      err,
 	}
 	if err == nil {
 		for i := range ve.NewFiles {
 			e := &ve.NewFiles[i]
 			info.Output = append(info.Output, e.Meta.TableInfo())
+			// Ingested tables are not necessarily flushed to L0. Record the level of
+			// each ingested file explicitly.
+			if ingest {
+				info.IngestLevels = append(info.IngestLevels, e.Level)
+			}
 		}
 		if len(ve.NewFiles) == 0 {
 			info.Err = errEmptyTable
@@ -1857,7 +2032,18 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 		if err != nil {
 			info.Err = err
 			// TODO(peter): untested.
-			d.mu.versions.obsoleteTables = append(d.mu.versions.obsoleteTables, pendingOutputs...)
+			for _, f := range pendingOutputs {
+				// Note that the FileBacking for the file metadata might not have
+				// been set yet. So, we directly use the FileNum. Since these
+				// files were generated as compaction outputs, these must be
+				// physical files on disk. This property might not hold once
+				// https://github.com/cockroachdb/pebble/issues/389 is
+				// implemented if #389 creates virtual sstables as output files.
+				d.mu.versions.obsoleteTables = append(
+					d.mu.versions.obsoleteTables,
+					fileInfo{f.FileNum.DiskFileNum(), f.Size},
+				)
+			}
 			d.mu.versions.updateObsoleteTableMetricsLocked()
 		}
 	} else {
@@ -1867,6 +2053,9 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	}
 
 	bytesFlushed = c.bytesIterated
+	d.mu.snapshots.cumulativePinnedCount += stats.cumulativePinnedKeys
+	d.mu.snapshots.cumulativePinnedSize += stats.cumulativePinnedSize
+
 	d.maybeUpdateDeleteCompactionHints(c)
 	d.removeInProgressCompaction(c, err != nil)
 	d.mu.versions.incrementCompactions(c.kind, c.extraLevels)
@@ -1878,6 +2067,13 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 		d.mu.mem.queue = d.mu.mem.queue[n:]
 		d.updateReadStateLocked(d.opts.DebugCheck)
 		d.updateTableStatsLocked(ve.NewFiles)
+		if ingest {
+			d.mu.versions.metrics.Flush.AsIngestCount++
+			for _, l := range c.metrics {
+				d.mu.versions.metrics.Flush.AsIngestBytes += l.BytesIngested
+				d.mu.versions.metrics.Flush.AsIngestTableCount += l.TablesIngested
+			}
+		}
 	}
 	// Signal FlushEnd after installing the new readState. This helps for unit
 	// tests that use the callback to trigger a read using an iterator with
@@ -2339,7 +2535,7 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	d.opts.EventListener.CompactionBegin(info)
 	startTime := d.timeNow()
 
-	ve, pendingOutputs, err := d.runCompaction(jobID, c)
+	ve, pendingOutputs, stats, err := d.runCompaction(jobID, c)
 
 	info.Duration = d.timeNow().Sub(startTime)
 	if err == nil {
@@ -2349,7 +2545,18 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 		})
 		if err != nil {
 			// TODO(peter): untested.
-			d.mu.versions.obsoleteTables = append(d.mu.versions.obsoleteTables, pendingOutputs...)
+			for _, f := range pendingOutputs {
+				// Note that the FileBacking for the file metadata might not have
+				// been set yet. So, we directly use the FileNum. Since these
+				// files were generated as compaction outputs, these must be
+				// physical files on disk. This property might not hold once
+				// https://github.com/cockroachdb/pebble/issues/389 is
+				// implemented if #389 creates virtual sstables as output files.
+				d.mu.versions.obsoleteTables = append(
+					d.mu.versions.obsoleteTables,
+					fileInfo{f.FileNum.DiskFileNum(), f.Size},
+				)
+			}
 			d.mu.versions.updateObsoleteTableMetricsLocked()
 		}
 	}
@@ -2362,6 +2569,9 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 			info.Output.Tables = append(info.Output.Tables, e.Meta.TableInfo())
 		}
 	}
+
+	d.mu.snapshots.cumulativePinnedCount += stats.cumulativePinnedKeys
+	d.mu.snapshots.cumulativePinnedSize += stats.cumulativePinnedSize
 
 	d.maybeUpdateDeleteCompactionHints(c)
 	d.removeInProgressCompaction(c, err != nil)
@@ -2384,6 +2594,11 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	return err
 }
 
+type compactStats struct {
+	cumulativePinnedKeys uint64
+	cumulativePinnedSize uint64
+}
+
 // runCompactions runs a compaction that produces new on-disk tables from
 // memtables or old on-disk tables.
 //
@@ -2391,7 +2606,7 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 // re-acquired during the course of this method.
 func (d *DB) runCompaction(
 	jobID int, c *compaction,
-) (ve *versionEdit, pendingOutputs []*fileMetadata, retErr error) {
+) (ve *versionEdit, pendingOutputs []physicalMeta, stats compactStats, retErr error) {
 	// As a sanity check, confirm that the smallest / largest keys for new and
 	// deleted files in the new versionEdit pass a validation function before
 	// returning the edit.
@@ -2427,7 +2642,7 @@ func (d *DB) runCompaction(
 			}
 			c.metrics[cl.level] = levelMetrics
 		}
-		return ve, nil, nil
+		return ve, nil, stats, nil
 	}
 
 	if c.kind == compactionKindIngestedFlushable {
@@ -2461,7 +2676,7 @@ func (d *DB) runCompaction(
 				{Level: c.outputLevel.level, Meta: meta},
 			},
 		}
-		return ve, nil, nil
+		return ve, nil, stats, nil
 	}
 
 	defer func() {
@@ -2480,7 +2695,7 @@ func (d *DB) runCompaction(
 
 	iiter, err := c.newInputIter(d.newIters, d.tableNewRangeKeyIter, snapshots)
 	if err != nil {
-		return nil, pendingOutputs, err
+		return nil, pendingOutputs, stats, err
 	}
 	c.allowedZeroSeqNum = c.allowZeroSeqNum()
 	iter := newCompactionIter(c.cmp, c.equal, c.formatKey, d.merge, iiter, snapshots,
@@ -2488,8 +2703,11 @@ func (d *DB) runCompaction(
 		c.elideRangeTombstone, d.FormatMajorVersion())
 
 	var (
-		createdFiles []base.FileNum
-		tw           *sstable.Writer
+		createdFiles    []base.DiskFileNum
+		tw              *sstable.Writer
+		pinnedKeySize   uint64
+		pinnedValueSize uint64
+		pinnedCount     uint64
 	)
 	defer func() {
 		if iter != nil {
@@ -2572,10 +2790,33 @@ func (d *DB) runCompaction(
 		d.mu.Lock()
 		fileNum := d.mu.versions.getNextFileNum()
 		fileMeta.FileNum = fileNum
-		pendingOutputs = append(pendingOutputs, fileMeta)
+		pendingOutputs = append(pendingOutputs, fileMeta.PhysicalMeta())
 		d.mu.Unlock()
 
-		writable, err := d.objProvider.Create(fileTypeTable, fileNum)
+		ctx := context.TODO()
+		if objiotracing.Enabled {
+			ctx = objiotracing.WithLevel(ctx, c.outputLevel.level)
+			switch c.kind {
+			case compactionKindFlush:
+				ctx = objiotracing.WithReason(ctx, objiotracing.ForFlush)
+			case compactionKindIngestedFlushable:
+				ctx = objiotracing.WithReason(ctx, objiotracing.ForIngestion)
+			default:
+				ctx = objiotracing.WithReason(ctx, objiotracing.ForCompaction)
+			}
+		}
+		// Prefer shared storage if present.
+		//
+		// TODO(bilal): This might be inefficient for short-lived files in higher
+		// levels if we're only writing to shared storage and not double-writing
+		// to local storage. Either implement double-writing functionality, or
+		// set PreferSharedStorage to c.outputLevel.level >= 5. The latter needs
+		// some careful handling around move compactions to ensure all files in
+		// lower levels are in shared storage.
+		createOpts := objstorage.CreateOptions{
+			PreferSharedStorage: true,
+		}
+		writable, objMeta, err := d.objProvider.Create(ctx, fileTypeTable, fileNum.DiskFileNum(), createOpts)
 		if err != nil {
 			return err
 		}
@@ -2587,7 +2828,7 @@ func (d *DB) runCompaction(
 		d.opts.EventListener.TableCreated(TableCreateInfo{
 			JobID:   jobID,
 			Reason:  reason,
-			Path:    d.objProvider.Path(fileTypeTable, fileNum),
+			Path:    d.objProvider.Path(objMeta),
 			FileNum: fileNum,
 		})
 		writable = &compactionWritable{
@@ -2595,9 +2836,8 @@ func (d *DB) runCompaction(
 			versions: d.mu.versions,
 			written:  &c.bytesWritten,
 		}
-		createdFiles = append(createdFiles, fileNum)
-		cacheOpts := private.SSTableCacheOpts(d.cacheID, fileNum).(sstable.WriterOption)
-		internalTableOpt := private.SSTableInternalTableOpt.(sstable.WriterOption)
+		createdFiles = append(createdFiles, fileNum.DiskFileNum())
+		cacheOpts := private.SSTableCacheOpts(d.cacheID, fileNum.DiskFileNum()).(sstable.WriterOption)
 
 		const MaxFileWriteAdditionalCPUTime = time.Millisecond * 100
 		cpuWorkHandle = d.opts.Experimental.CPUWorkPermissionGranter.GetPermission(
@@ -2607,7 +2847,7 @@ func (d *DB) runCompaction(
 			d.opts.Experimental.MaxWriterConcurrency > 0 &&
 				(cpuWorkHandle.Permitted() || d.opts.Experimental.ForceWriterParallelism)
 
-		tw = sstable.NewWriter(writable, writerOpts, cacheOpts, internalTableOpt, &prevPointKey)
+		tw = sstable.NewWriter(writable, writerOpts, cacheOpts, &prevPointKey)
 
 		fileMeta.CreationTime = time.Now().Unix()
 		ve.NewFiles = append(ve.NewFiles, newFileEntry{
@@ -2706,7 +2946,22 @@ func (d *DB) runCompaction(
 		if tw == nil {
 			return nil
 		}
-
+		{
+			// Set internal sstable properties.
+			p := getInternalWriterProperties(tw)
+			// Set the external sst version to 0. This is what RocksDB expects for
+			// db-internal sstables; otherwise, it could apply a global sequence number.
+			p.ExternalFormatVersion = 0
+			// Set the snapshot pinned totals.
+			p.SnapshotPinnedKeys = pinnedCount
+			p.SnapshotPinnedKeySize = pinnedKeySize
+			p.SnapshotPinnedValueSize = pinnedValueSize
+			stats.cumulativePinnedKeys += pinnedCount
+			stats.cumulativePinnedSize += pinnedKeySize + pinnedValueSize
+			pinnedCount = 0
+			pinnedKeySize = 0
+			pinnedValueSize = 0
+		}
 		if err := tw.Close(); err != nil {
 			tw = nil
 			return err
@@ -2723,9 +2978,13 @@ func (d *DB) runCompaction(
 		meta.Size = writerMeta.Size
 		meta.SmallestSeqNum = writerMeta.SmallestSeqNum
 		meta.LargestSeqNum = writerMeta.LargestSeqNum
+		meta.InitPhysicalBacking()
+
 		// If the file didn't contain any range deletions, we can fill its
 		// table stats now, avoiding unnecessarily loading the table later.
-		maybeSetStatsFromProperties(meta, &writerMeta.Properties)
+		maybeSetStatsFromProperties(
+			meta.PhysicalMeta(), &writerMeta.Properties,
+		)
 
 		if c.flushing == nil {
 			outputMetrics.TablesCompacted++
@@ -2822,30 +3081,32 @@ func (d *DB) runCompaction(
 		return nil
 	}
 
-	// compactionOutputSplitters contain all logic to determine whether the
-	// compaction loop should stop writing to one output sstable and switch to
-	// a new one. Some splitters can wrap other splitters, and
-	// the splitterGroup can be composed of multiple splitters. In this case,
-	// we start off with splitters for file sizes, grandparent limits, and (for
-	// L0 splits) L0 limits, before wrapping them in an splitterGroup.
+	// Build a compactionOutputSplitter that contains all logic to determine
+	// whether the compaction loop should stop writing to one output sstable and
+	// switch to a new one. Some splitters can wrap other splitters, and the
+	// splitterGroup can be composed of multiple splitters. In this case, we
+	// start off with splitters for file sizes, grandparent limits, and (for L0
+	// splits) L0 limits, before wrapping them in an splitterGroup.
+	sizeSplitter := newFileSizeSplitter(&iter.frontiers, c.maxOutputFileSize, c.grandparents.Iter())
+	unsafePrevUserKey := func() []byte {
+		// Return the largest point key written to tw or the start of
+		// the current range deletion in the fragmenter, whichever is
+		// greater.
+		prevPoint := prevPointKey.UnsafeKey()
+		if c.cmp(prevPoint.UserKey, c.rangeDelFrag.Start()) > 0 {
+			return prevPoint.UserKey
+		}
+		return c.rangeDelFrag.Start()
+	}
 	outputSplitters := []compactionOutputSplitter{
 		// We do not split the same user key across different sstables within
 		// one flush or compaction. The fileSizeSplitter may request a split in
 		// the middle of a user key, so the userKeyChangeSplitter ensures we are
 		// at a user key change boundary when doing a split.
 		&userKeyChangeSplitter{
-			cmp:      c.cmp,
-			splitter: &fileSizeSplitter{maxFileSize: c.maxOutputFileSize},
-			unsafePrevUserKey: func() []byte {
-				// Return the largest point key written to tw or the start of
-				// the current range deletion in the fragmenter, whichever is
-				// greater.
-				prevPoint := prevPointKey.UnsafeKey()
-				if c.cmp(prevPoint.UserKey, c.rangeDelFrag.Start()) > 0 {
-					return prevPoint.UserKey
-				}
-				return c.rangeDelFrag.Start()
-			},
+			cmp:               c.cmp,
+			splitter:          sizeSplitter,
+			unsafePrevUserKey: unsafePrevUserKey,
 		},
 		newLimitFuncSplitter(&iter.frontiers, c.findGrandparentLimit),
 	}
@@ -2949,11 +3210,19 @@ func (d *DB) runCompaction(
 			}
 			if tw == nil {
 				if err := newOutput(); err != nil {
-					return nil, pendingOutputs, err
+					return nil, pendingOutputs, stats, err
 				}
 			}
 			if err := tw.Add(*key, val); err != nil {
-				return nil, pendingOutputs, err
+				return nil, pendingOutputs, stats, err
+			}
+			if iter.snapshotPinned {
+				// The kv pair we just added to the sstable was only surfaced by
+				// the compaction iterator because an open snapshot prevented
+				// its elision. Increment the stats.
+				pinnedCount++
+				pinnedKeySize += uint64(len(key.UserKey)) + base.InternalTrailerLen
+				pinnedValueSize += uint64(len(val))
 			}
 		}
 
@@ -2981,7 +3250,7 @@ func (d *DB) runCompaction(
 			splitKey = key.UserKey
 		}
 		if err := finishOutput(splitKey); err != nil {
-			return nil, pendingOutputs, err
+			return nil, pendingOutputs, stats, err
 		}
 	}
 
@@ -2997,15 +3266,15 @@ func (d *DB) runCompaction(
 		}
 	}
 
-	if err := d.dataDir.Sync(); err != nil {
-		return nil, pendingOutputs, err
+	if err := d.objProvider.Sync(); err != nil {
+		return nil, pendingOutputs, stats, err
 	}
 
 	// Refresh the disk available statistic whenever a compaction/flush
 	// completes, before re-acquiring the mutex.
 	_ = d.calculateDiskAvailableBytes()
 
-	return ve, pendingOutputs, nil
+	return ve, pendingOutputs, stats, nil
 }
 
 // validateVersionEdit validates that start and end keys across new and deleted
@@ -3052,11 +3321,11 @@ func (d *DB) scanObsoleteFiles(list []string) {
 	d.opts.DisableAutomaticCompactions = true
 
 	// Wait for any ongoing compaction to complete before continuing.
-	if d.mu.compact.compactingCount > 0 || d.mu.compact.flushing {
+	for d.mu.compact.compactingCount > 0 || d.mu.compact.flushing {
 		d.mu.compact.cond.Wait()
 	}
 
-	liveFileNums := make(map[FileNum]struct{})
+	liveFileNums := make(map[base.DiskFileNum]struct{})
 	d.mu.versions.addLiveFileNums(liveFileNums)
 	// Protect against files which are only referred to by the ingestedFlushable
 	// from being deleted. These are added to the flushable queue on WAL replay
@@ -3066,7 +3335,7 @@ func (d *DB) scanObsoleteFiles(list []string) {
 	for _, fEntry := range d.mu.mem.queue {
 		if f, ok := fEntry.flushable.(*ingestedFlushable); ok {
 			for _, file := range f.files {
-				liveFileNums[file.FileNum] = struct{}{}
+				liveFileNums[file.FileBacking.DiskFileNum] = struct{}{}
 			}
 		}
 	}
@@ -3075,63 +3344,73 @@ func (d *DB) scanObsoleteFiles(list []string) {
 	manifestFileNum := d.mu.versions.manifestFileNum
 
 	var obsoleteLogs []fileInfo
-	var obsoleteTables []*fileMetadata
+	var obsoleteTables []fileInfo
 	var obsoleteManifests []fileInfo
 	var obsoleteOptions []fileInfo
 
 	for _, filename := range list {
-		fileType, fileNum, ok := base.ParseFilename(d.opts.FS, filename)
+		fileType, diskFileNum, ok := base.ParseFilename(d.opts.FS, filename)
 		if !ok {
 			continue
 		}
 		switch fileType {
 		case fileTypeLog:
-			if fileNum >= minUnflushedLogNum {
+			if diskFileNum.FileNum() >= minUnflushedLogNum {
 				continue
 			}
-			fi := fileInfo{fileNum: fileNum}
+			fi := fileInfo{fileNum: diskFileNum}
 			if stat, err := d.opts.FS.Stat(filename); err == nil {
 				fi.fileSize = uint64(stat.Size())
 			}
 			obsoleteLogs = append(obsoleteLogs, fi)
 		case fileTypeManifest:
-			if fileNum >= manifestFileNum {
+			if diskFileNum.FileNum() >= manifestFileNum {
 				continue
 			}
-			fi := fileInfo{fileNum: fileNum}
+			fi := fileInfo{fileNum: diskFileNum}
 			if stat, err := d.opts.FS.Stat(filename); err == nil {
 				fi.fileSize = uint64(stat.Size())
 			}
 			obsoleteManifests = append(obsoleteManifests, fi)
 		case fileTypeOptions:
-			if fileNum >= d.optionsFileNum {
+			if diskFileNum.FileNum() >= d.optionsFileNum.FileNum() {
 				continue
 			}
-			fi := fileInfo{fileNum: fileNum}
+			fi := fileInfo{fileNum: diskFileNum}
 			if stat, err := d.opts.FS.Stat(filename); err == nil {
 				fi.fileSize = uint64(stat.Size())
 			}
 			obsoleteOptions = append(obsoleteOptions, fi)
 		case fileTypeTable:
-			if _, ok := liveFileNums[fileNum]; ok {
-				continue
-			}
-			fileMeta := &fileMetadata{
-				FileNum: fileNum,
-			}
-			if stat, err := d.opts.FS.Stat(filename); err == nil {
-				fileMeta.Size = uint64(stat.Size())
-			}
-			obsoleteTables = append(obsoleteTables, fileMeta)
+			// Objects are handled through the objstorage provider below.
 		default:
 			// Don't delete files we don't know about.
-			continue
+		}
+	}
+
+	objects := d.objProvider.List()
+	for _, obj := range objects {
+		switch obj.FileType {
+		case fileTypeTable:
+			if _, ok := liveFileNums[obj.DiskFileNum]; ok {
+				continue
+			}
+			fileInfo := fileInfo{
+				fileNum: obj.DiskFileNum,
+			}
+			if size, err := d.objProvider.Size(obj); err == nil {
+				fileInfo.fileSize = uint64(size)
+			}
+			obsoleteTables = append(obsoleteTables, fileInfo)
+
+		default:
+			// Ignore object types we don't know about.
 		}
 	}
 
 	d.mu.log.queue = merge(d.mu.log.queue, obsoleteLogs)
 	d.mu.versions.metrics.WAL.Files = int64(len(d.mu.log.queue))
-	d.mu.versions.obsoleteTables = mergeFileMetas(d.mu.versions.obsoleteTables, obsoleteTables)
+	d.mu.versions.obsoleteTables = mergeFileInfo(d.mu.versions.obsoleteTables, obsoleteTables)
 	d.mu.versions.updateObsoleteTableMetricsLocked()
 	d.mu.versions.obsoleteManifests = merge(d.mu.versions.obsoleteManifests, obsoleteManifests)
 	d.mu.versions.obsoleteOptions = merge(d.mu.versions.obsoleteOptions, obsoleteOptions)
@@ -3212,13 +3491,13 @@ func (d *DB) deleteObsoleteFiles(jobID int, waitForOngoing bool) {
 // obsoleteFile holds information about a file that needs to be deleted soon.
 type obsoleteFile struct {
 	dir      string
-	fileNum  base.FileNum
+	fileNum  base.DiskFileNum
 	fileType fileType
 	fileSize uint64
 }
 
 type fileInfo struct {
-	fileNum  FileNum
+	fileNum  base.DiskFileNum
 	fileSize uint64
 }
 
@@ -3239,7 +3518,7 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		// log that has not had its contents flushed to an sstable. We can recycle
 		// the prefix of d.mu.log.queue with log numbers less than
 		// minUnflushedLogNum.
-		if d.mu.log.queue[i].fileNum >= d.mu.versions.minUnflushedLogNum {
+		if d.mu.log.queue[i].fileNum.FileNum() >= d.mu.versions.minUnflushedLogNum {
 			obsoleteLogs = d.mu.log.queue[:i]
 			d.mu.log.queue = d.mu.log.queue[i:]
 			d.mu.versions.metrics.WAL.Files -= int64(len(obsoleteLogs))
@@ -3247,19 +3526,14 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		}
 	}
 
-	for _, table := range d.mu.versions.obsoleteTables {
-		obsoleteTables = append(obsoleteTables, fileInfo{
-			fileNum:  table.FileNum,
-			fileSize: table.Size,
-		})
-	}
+	obsoleteTables = append(obsoleteTables, d.mu.versions.obsoleteTables...)
 	d.mu.versions.obsoleteTables = nil
 
 	// Sort the manifests cause we want to delete some contiguous prefix
 	// of the older manifests.
 	sort.Slice(d.mu.versions.obsoleteManifests, func(i, j int) bool {
-		return d.mu.versions.obsoleteManifests[i].fileNum <
-			d.mu.versions.obsoleteManifests[j].fileNum
+		return d.mu.versions.obsoleteManifests[i].fileNum.FileNum() <
+			d.mu.versions.obsoleteManifests[j].fileNum.FileNum()
 	})
 
 	var obsoleteManifests []fileInfo
@@ -3295,7 +3569,7 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		// We sort to make the order of deletions deterministic, which is nice for
 		// tests.
 		sort.Slice(f.obsolete, func(i, j int) bool {
-			return f.obsolete[i].fileNum < f.obsolete[j].fileNum
+			return f.obsolete[i].fileNum.FileNum() < f.obsolete[j].fileNum.FileNum()
 		})
 		for _, fi := range f.obsolete {
 			dir := d.dirname
@@ -3376,14 +3650,20 @@ func (d *DB) maybeScheduleObsoleteTableDeletion() {
 	}()
 }
 
-func (d *DB) deleteObsoleteObject(fileType fileType, jobID int, fileNum FileNum) {
+func (d *DB) deleteObsoleteObject(fileType fileType, jobID int, fileNum base.DiskFileNum) {
 	if fileType != fileTypeTable {
 		panic("not an object")
 	}
 
-	path := d.objProvider.Path(fileType, fileNum)
-	err := d.objProvider.Remove(fileType, fileNum)
-	if objstorage.IsNotExistError(err) {
+	var path string
+	meta, err := d.objProvider.Lookup(fileType, fileNum)
+	if err != nil {
+		path = "<nil>"
+	} else {
+		path = d.objProvider.Path(meta)
+		err = d.objProvider.Remove(fileType, fileNum)
+	}
+	if d.objProvider.IsNotExistError(err) {
 		return
 	}
 
@@ -3392,14 +3672,16 @@ func (d *DB) deleteObsoleteObject(fileType fileType, jobID int, fileNum FileNum)
 		d.opts.EventListener.TableDeleted(TableDeleteInfo{
 			JobID:   jobID,
 			Path:    path,
-			FileNum: fileNum,
+			FileNum: fileNum.FileNum(),
 			Err:     err,
 		})
 	}
 }
 
 // deleteObsoleteFile deletes a (non-object) file that is no longer needed.
-func (d *DB) deleteObsoleteFile(fileType fileType, jobID int, path string, fileNum FileNum) {
+func (d *DB) deleteObsoleteFile(
+	fileType fileType, jobID int, path string, fileNum base.DiskFileNum,
+) {
 	// TODO(peter): need to handle this error, probably by re-adding the
 	// file that couldn't be deleted to one of the obsolete slices map.
 	err := d.opts.Cleaner.Clean(d.opts.FS, fileType, path)
@@ -3412,14 +3694,14 @@ func (d *DB) deleteObsoleteFile(fileType fileType, jobID int, path string, fileN
 		d.opts.EventListener.WALDeleted(WALDeleteInfo{
 			JobID:   jobID,
 			Path:    path,
-			FileNum: fileNum,
+			FileNum: fileNum.FileNum(),
 			Err:     err,
 		})
 	case fileTypeManifest:
 		d.opts.EventListener.ManifestDeleted(ManifestDeleteInfo{
 			JobID:   jobID,
 			Path:    path,
-			FileNum: fileNum,
+			FileNum: fileNum.FileNum(),
 			Err:     err,
 		})
 	case fileTypeTable:
@@ -3434,7 +3716,7 @@ func merge(a, b []fileInfo) []fileInfo {
 
 	a = append(a, b...)
 	sort.Slice(a, func(i, j int) bool {
-		return a[i].fileNum < a[j].fileNum
+		return a[i].fileNum.FileNum() < a[j].fileNum.FileNum()
 	})
 
 	n := 0
@@ -3447,19 +3729,19 @@ func merge(a, b []fileInfo) []fileInfo {
 	return a[:n]
 }
 
-func mergeFileMetas(a, b []*fileMetadata) []*fileMetadata {
+func mergeFileInfo(a, b []fileInfo) []fileInfo {
 	if len(b) == 0 {
 		return a
 	}
 
 	a = append(a, b...)
 	sort.Slice(a, func(i, j int) bool {
-		return a[i].FileNum < a[j].FileNum
+		return a[i].fileNum.FileNum() < a[j].fileNum.FileNum()
 	})
 
 	n := 0
 	for i := 0; i < len(a); i++ {
-		if n == 0 || a[i].FileNum != a[n-1].FileNum {
+		if n == 0 || a[i].fileNum != a[n-1].fileNum {
 			a[n] = a[i]
 			n++
 		}

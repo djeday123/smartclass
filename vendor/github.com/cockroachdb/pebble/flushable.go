@@ -5,6 +5,7 @@
 package pebble
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -64,11 +65,11 @@ type flushableEntry struct {
 	releaseMemAccounting func()
 	// unrefFiles, if not nil, should be invoked to decrease the ref count of
 	// files which are backing the flushable.
-	unrefFiles func() []*fileMetadata
+	unrefFiles func() []*fileBacking
 	// deleteFnLocked should be called if the caller is holding DB.mu.
-	deleteFnLocked func(obsolete []*fileMetadata)
+	deleteFnLocked func(obsolete []*fileBacking)
 	// deleteFn should be called if the caller is not holding DB.mu.
-	deleteFn func(obsolete []*fileMetadata)
+	deleteFn func(obsolete []*fileBacking)
 }
 
 func (e *flushableEntry) readerRef() {
@@ -89,7 +90,7 @@ func (e *flushableEntry) readerUnrefLocked(deleteFiles bool) {
 }
 
 func (e *flushableEntry) readerUnrefHelper(
-	deleteFiles bool, deleteFn func(obsolete []*manifest.FileMetadata),
+	deleteFiles bool, deleteFn func(obsolete []*fileBacking),
 ) {
 	switch v := atomic.AddInt32(&e.readerRefs, -1); {
 	case v < 0:
@@ -115,7 +116,7 @@ type flushableList []*flushableEntry
 // ingestedFlushable is the implementation of the flushable interface for the
 // ingesting sstables which are added to the flushable list.
 type ingestedFlushable struct {
-	files            []*fileMetadata
+	files            []physicalMeta
 	cmp              Compare
 	split            Split
 	newIters         tableNewIters
@@ -135,25 +136,31 @@ func newIngestedFlushable(
 	newIters tableNewIters,
 	newRangeKeyIters keyspan.TableNewSpanIter,
 ) *ingestedFlushable {
+	var physicalFiles []physicalMeta
+	var hasRangeKeys bool
+	for _, f := range files {
+		if f.HasRangeKeys {
+			hasRangeKeys = true
+		}
+		physicalFiles = append(physicalFiles, f.PhysicalMeta())
+	}
+
 	ret := &ingestedFlushable{
-		files:            files,
+		files:            physicalFiles,
 		cmp:              cmp,
 		split:            split,
 		newIters:         newIters,
 		newRangeKeyIters: newRangeKeyIters,
 		// slice is immutable and can be set once and used many times.
-		slice: manifest.NewLevelSliceKeySorted(cmp, files),
-	}
-
-	for _, f := range files {
-		if f.HasRangeKeys {
-			ret.hasRangeKeys = true
-			break
-		}
+		slice:        manifest.NewLevelSliceKeySorted(cmp, files),
+		hasRangeKeys: hasRangeKeys,
 	}
 
 	return ret
 }
+
+// TODO(sumeer): ingestedFlushable iters also need to plumb context for
+// tracing.
 
 func (s *ingestedFlushable) newIter(o *IterOptions) internalIterator {
 	var opts IterOptions
@@ -181,7 +188,7 @@ func (s *ingestedFlushable) constructRangeDelIter(
 ) (keyspan.FragmentIterator, error) {
 	// Note that the keyspan level iter expects a non-nil iterator to be
 	// returned even if there is an error. So, we return the emptyKeyspanIter.
-	iter, rangeDelIter, err := s.newIters(file, nil, internalIterOpts{})
+	iter, rangeDelIter, err := s.newIters(context.Background(), file, nil, internalIterOpts{})
 	if err != nil {
 		return emptyKeyspanIter, err
 	}

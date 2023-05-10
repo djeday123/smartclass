@@ -222,6 +222,16 @@ func (o *IterOptions) getLogger() Logger {
 	return o.logger
 }
 
+// scanInternalOptions is similar to IterOptions, meant for use with
+// scanInternalIterator.
+type scanInternalOptions struct {
+	IterOptions
+
+	// skipSharedLevels skips levels that are shareable (level >=
+	// sharedLevelStart).
+	skipSharedLevels bool
+}
+
 // RangeKeyMasking configures automatic hiding of point keys by range keys. A
 // non-nil Suffix enables range-key masking. When enabled, range keys with
 // suffixes ≥ Suffix behave as masks. All point keys that are contained within a
@@ -454,17 +464,27 @@ type Options struct {
 	// TODO(peter): untested
 	DisableWAL bool
 
-	// ErrorIfExists is whether it is an error if the database already exists.
+	// ErrorIfExists causes an error on Open if the database already exists.
+	// The error can be checked with errors.Is(err, ErrDBAlreadyExists).
 	//
 	// The default value is false.
 	ErrorIfExists bool
 
-	// ErrorIfNotExists is whether it is an error if the database does not
-	// already exist.
+	// ErrorIfNotExists causes an error on Open if the database does not already
+	// exist. The error can be checked with errors.Is(err, ErrDBDoesNotExist).
 	//
 	// The default value is false which will cause a database to be created if it
 	// does not already exist.
 	ErrorIfNotExists bool
+
+	// ErrorIfNotPristine causes an error on Open if the database already exists
+	// and any operations have been performed on the database. The error can be
+	// checked with errors.Is(err, ErrDBNotPristine).
+	//
+	// Note that a database that contained keys that were all subsequently deleted
+	// may or may not trigger the error. Currently, we check if there are any live
+	// SSTs or log records to replay.
+	ErrorIfNotPristine bool
 
 	// EventListener provides hooks to listening to significant DB events such as
 	// flushes, compactions, and table deletion.
@@ -617,14 +637,10 @@ type Options struct {
 		// sstables, and does not start rewriting existing sstables.
 		RequiredInPlaceValueBound UserKeyPrefixBound
 
-		// IngestSSTablesAsFlushable is used to determine if ingested sstables
-		// should be ingested as a flushable. By default this is false, but it
-		// is true for all metamorphic tests.
-		//
-		// TODO(bananabrick): Remove this field and enable by default once
-		// https://github.com/cockroachdb/pebble/issues/2292 and
-		// https://github.com/cockroachdb/pebble/issues/2266 are closed.
-		IngestSSTablesAsFlushable bool
+		// DisableIngestAsFlushable disables lazy ingestion of sstables through
+		// a WAL write and memtable rotation. Only effectual if the the format
+		// major version is at least `FormatFlushableIngest`.
+		DisableIngestAsFlushable func() bool
 
 		// SharedStorage is a second FS-like storage medium that can be shared
 		// between multiple Pebble instances. It is used to store sstables only, and
@@ -709,10 +725,15 @@ type Options struct {
 	// options for the last level are used for all subsequent levels.
 	Levels []LevelOptions
 
+	// LoggerAndTracer will be used, if non-nil, else Logger will be used and
+	// tracing will be a noop.
+
 	// Logger used to write log messages.
 	//
 	// The default logger uses the Go standard library log package.
 	Logger Logger
+	// LoggerAndTracer is used for writing log messages and traces.
+	LoggerAndTracer LoggerAndTracer
 
 	// MaxManifestFileSize is the maximum size the MANIFEST file is allowed to
 	// become. When the MANIFEST exceeds this size it is rolled over and a new
@@ -890,6 +911,9 @@ func (o *Options) EnsureDefaults() *Options {
 	if o.Comparer == nil {
 		o.Comparer = DefaultComparer
 	}
+	if o.Experimental.DisableIngestAsFlushable == nil {
+		o.Experimental.DisableIngestAsFlushable = func() bool { return false }
+	}
 	if o.Experimental.L0CompactionConcurrency <= 0 {
 		o.Experimental.L0CompactionConcurrency = 10
 	}
@@ -1024,12 +1048,8 @@ func (o *Options) WithFSDefaults() *Options {
 		o.FS = vfs.Default
 	}
 	o.FS, o.private.fsCloser = vfs.WithDiskHealthChecks(o.FS, 5*time.Second,
-		func(name string, op vfs.OpType, duration time.Duration) {
-			o.EventListener.DiskSlow(DiskSlowInfo{
-				Path:     name,
-				OpType:   op,
-				Duration: duration,
-			})
+		func(info vfs.DiskSlowInfo) {
+			o.EventListener.DiskSlow(info)
 		})
 	return o
 }
@@ -1113,6 +1133,9 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  compaction_debt_concurrency=%d\n", o.Experimental.CompactionDebtConcurrency)
 	fmt.Fprintf(&buf, "  comparer=%s\n", o.Comparer.Name)
 	fmt.Fprintf(&buf, "  disable_wal=%t\n", o.DisableWAL)
+	if o.Experimental.DisableIngestAsFlushable != nil && o.Experimental.DisableIngestAsFlushable() {
+		fmt.Fprintf(&buf, "  disable_ingest_as_flushable=%t\n", true)
+	}
 	fmt.Fprintf(&buf, "  flush_delay_delete_range=%s\n", o.FlushDelayDeleteRange)
 	fmt.Fprintf(&buf, "  flush_delay_range_key=%s\n", o.FlushDelayRangeKey)
 	fmt.Fprintf(&buf, "  flush_split_bytes=%d\n", o.FlushSplitBytes)
@@ -1175,6 +1198,7 @@ func (o *Options) String() string {
 		fmt.Fprintf(&buf, "[Level \"%d\"]\n", i)
 		fmt.Fprintf(&buf, "  block_restart_interval=%d\n", l.BlockRestartInterval)
 		fmt.Fprintf(&buf, "  block_size=%d\n", l.BlockSize)
+		fmt.Fprintf(&buf, "  block_size_threshold=%d\n", l.BlockSizeThreshold)
 		fmt.Fprintf(&buf, "  compression=%s\n", l.Compression)
 		fmt.Fprintf(&buf, "  filter_policy=%s\n", filterPolicyName(l.FilterPolicy))
 		fmt.Fprintf(&buf, "  filter_type=%s\n", l.FilterType)
@@ -1313,6 +1337,12 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				o.private.disableDeleteOnlyCompactions, err = strconv.ParseBool(value)
 			case "disable_elision_only_compactions":
 				o.private.disableElisionOnlyCompactions, err = strconv.ParseBool(value)
+			case "disable_ingest_as_flushable":
+				var v bool
+				v, err = strconv.ParseBool(value)
+				if err == nil {
+					o.Experimental.DisableIngestAsFlushable = func() bool { return v }
+				}
 			case "disable_lazy_combined_iteration":
 				o.private.disableLazyCombinedIteration, err = strconv.ParseBool(value)
 			case "disable_wal":
@@ -1447,6 +1477,8 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				l.BlockRestartInterval, err = strconv.Atoi(value)
 			case "block_size":
 				l.BlockSize, err = strconv.Atoi(value)
+			case "block_size_threshold":
+				l.BlockSizeThreshold, err = strconv.Atoi(value)
 			case "compression":
 				switch value {
 				case "Default":
@@ -1572,6 +1604,7 @@ func (o *Options) MakeReaderOptions() sstable.ReaderOptions {
 		if o.Merger != nil {
 			readerOpts.MergerName = o.Merger.Name
 		}
+		readerOpts.LoggerAndTracer = o.LoggerAndTracer
 	}
 	return readerOpts
 }
